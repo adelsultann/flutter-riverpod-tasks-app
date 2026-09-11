@@ -1,0 +1,498 @@
+# Local Supabase Email/Password Authentication Guide
+
+This guide explains the authentication feature in `tasks_app` from local
+Supabase configuration through the final sign-in, sign-up, sign-out, and route
+protection behavior.
+
+The feature uses:
+
+- **Supabase** for email/password accounts and sessions.
+- **Riverpod** for dependency injection and UI state.
+- **GoRouter** for typed routes and authentication redirects.
+- A feature-first structure: `domain`, `data`, `application`, and
+  `presentation`.
+
+## 1. Start local Supabase
+
+Start the local Supabase stack from the directory that contains your Supabase
+project configuration:
+
+```powershell
+supabase start
+```
+
+For this project, the local API is available at:
+
+```text
+http://127.0.0.1:55552
+```
+
+`127.0.0.1` means *this computer*. An Android emulator has its own virtual
+network, so it uses this special address to reach the host computer:
+
+```text
+http://10.0.2.2:55552
+```
+
+Use `127.0.0.1` for a desktop/browser run on the host computer, and
+`10.0.2.2` for the Android emulator.
+
+> Do not commit real service-role keys. A Flutter client uses a publishable
+> (anon) key, not a service-role key.
+
+## 2. Pass Supabase settings with Dart defines
+
+File: `tool/local.json`
+
+```json
+{
+  "SUPABASE_URL": "http://10.0.2.2:55552",
+  "SUPABASE_PUBLISHABLE_KEY": "your-local-publishable-key"
+}
+```
+
+This keeps environment-specific values outside Dart source. It also allows a
+different `staging.json` or `production.json` file later without changing
+authentication code.
+
+File: `.vscode/launch.json`
+
+```json
+{
+  "name": "Tasks App — Local Supabase",
+  "request": "launch",
+  "type": "dart",
+  "toolArgs": ["--dart-define-from-file=tool/local.json"]
+}
+```
+
+The `toolArgs` entry tells Flutter to read the values in `tool/local.json`
+whenever that launch configuration is used.
+
+You can run the same configuration from a terminal:
+
+```powershell
+flutter run --dart-define-from-file=tool/local.json
+```
+
+## 3. Read and validate settings
+
+File: `lib/app/config/supabase_settings.dart`
+
+`SupabaseSetting` is a small configuration object containing the Supabase URL
+and publishable key.
+
+### `SupabaseSetting.fromDartDefine()`
+
+This factory constructor:
+
+1. Reads `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` with
+   `String.fromEnvironment`.
+2. Verifies that neither value is empty.
+3. Throws an early, useful error if the run configuration is missing.
+4. Returns a validated `SupabaseSetting` object.
+
+The values passed to `String.fromEnvironment` must be declared with `const`.
+On Android, changing `const` to `final` means the values are not compiled from
+the Dart defines correctly.
+
+## 4. Initialize Supabase before the app starts
+
+File: `lib/main.dart`
+
+The startup order is important:
+
+```text
+WidgetsFlutterBinding.ensureInitialized()
+→ read validated settings
+→ await Supabase.initialize(...)
+→ runApp(...)
+```
+
+### `main()`
+
+`main()` is asynchronous because `Supabase.initialize` must finish before the
+widgets start reading `Supabase.instance.client`. It first calls
+`WidgetsFlutterBinding.ensureInitialized()` because Flutter plugins need a
+binding before asynchronous initialization. It then creates the app inside a
+`ProviderScope`, which enables Riverpod throughout the widget tree.
+
+### `App`
+
+`App` is a `ConsumerWidget` because it watches `routerProvider`. It passes the
+resulting router to `MaterialApp.router`, letting GoRouter control navigation.
+
+## 5. Keep responsibility in the correct layer
+
+The auth feature has this dependency direction:
+
+```text
+presentation → application → domain ← data
+                          ↑
+                    core wiring
+```
+
+| Layer | Folder | Responsibility |
+| --- | --- | --- |
+| Domain | `lib/features/auth/domain` | App concepts and interfaces; no Supabase or Flutter SDK types. |
+| Data | `lib/features/auth/data` | The Supabase implementation of the domain interface. |
+| Application | `lib/features/auth/application` | Riverpod state and user actions. |
+| Presentation | `lib/features/auth/presentation` | Forms and widgets. |
+| Core | `lib/core/supabase` | Builds the concrete repository used by the app. |
+
+This separation is why screens do not import `supabase_flutter` and why the
+domain layer does not contain a password field or Supabase `User`.
+
+## 6. Define the domain user
+
+File: `lib/features/auth/domain/app_user.dart`
+
+### `AppUser`
+
+`AppUser` is an immutable Freezed model representing the user information the
+app currently needs: only an `id`.
+
+```dart
+const factory AppUser({required String id}) = _AppUser;
+```
+
+Passwords are deliberately absent. The app submits a password to Supabase but
+does not store it in its domain model, Riverpod state, or local database.
+
+### `AppUser.fromJson()`
+
+This factory recreates `AppUser` from JSON if the app later needs to persist or
+transport it.
+
+### Generated files
+
+`app_user.freezed.dart` and `app_user.g.dart` are generated by Freezed and
+JSON serialization. Do not manually edit them. Regenerate them after changing
+`app_user.dart`:
+
+```powershell
+dart run build_runner build --delete-conflicting-outputs
+```
+
+## 7. Define the authentication contract
+
+File: `lib/features/auth/domain/auth_repository.dart`
+
+### `AuthRepository`
+
+`AuthRepository` is an abstract interface. It describes what the app can do
+without deciding how it does it.
+
+| Member | Meaning |
+| --- | --- |
+| `currentUser` | A one-time read of the cached session user, or `null`. |
+| `authStateChanges()` | A stream that emits after auth events. |
+| `signUpWithEmail(...)` | Creates an account. |
+| `signInWithEmail(...)` | Starts a session for an existing account. |
+| `signOut()` | Ends the current session. |
+
+All commands return `Future<void>` because callers do not need a Supabase
+response object. Session updates arrive through `authStateChanges()` instead.
+
+## 8. Implement the contract with Supabase
+
+File: `lib/features/auth/data/supabase_auth_repository.dart`
+
+### `SupabaseAuthRepository`
+
+This class implements `AuthRepository` using an injected `SupabaseClient`.
+Constructor injection makes it testable: a test can supply a fake client or a
+different implementation.
+
+### `_toAppUser(User? user)`
+
+This private mapper translates the Supabase SDK model into the domain model:
+
+```text
+Supabase User → AppUser(id: user.id)
+null          → null
+```
+
+This is the boundary that prevents Supabase types from leaking into the rest
+of the app.
+
+### `currentUser`
+
+The getter maps `_client.auth.currentUser` into `AppUser?`. It is useful for a
+one-time read, but it is not the mechanism used to update the UI over time.
+
+### `authStateChanges()`
+
+Supabase emits an auth event whenever its session changes. The repository maps
+the *event's* session:
+
+```dart
+event.session?.user
+```
+
+It must not map `_client.auth.currentUser` inside the callback. The event is
+the authoritative state transition. On sign-out, `event.session` is `null`, so
+this implementation emits `null` and the router can redirect to sign-in.
+
+### `signUpWithEmail`, `signInWithEmail`, and `signOut`
+
+These methods delegate directly to:
+
+```dart
+_client.auth.signUp(...)
+_client.auth.signInWithPassword(...)
+_client.auth.signOut()
+```
+
+Supabase errors are allowed to reach the application controller, which turns
+them into Riverpod error state for the UI.
+
+## 9. Wire the concrete implementation once
+
+File: `lib/core/supabase/auth_providers.dart`
+
+### `authRepositoryProvider`
+
+```dart
+final authRepositoryProvider = Provider<AuthRepository>((ref) {
+  return SupabaseAuthRepository(Supabase.instance.client);
+});
+```
+
+This is the one place that knows both the abstract `AuthRepository` interface
+and the concrete `SupabaseAuthRepository` class.
+
+The provider **creates** `SupabaseAuthRepository`, but its declared type is
+`AuthRepository`. Consumers depend on the interface, which makes a later
+switch to a fake or different backend much easier.
+
+## 10. Expose session state with Riverpod
+
+File: `lib/features/auth/application/auth_providers.dart`
+
+### `authStateProvider`
+
+`authStateProvider` is a `StreamProvider<AppUser?>`. It watches
+`authRepositoryProvider` and returns `authStateChanges()`.
+
+Its possible values are:
+
+| Riverpod state | Meaning |
+| --- | --- |
+| Loading | Supabase is restoring the initial saved session. |
+| Data with `AppUser` | A user is authenticated. |
+| Data with `null` | No user is authenticated. |
+| Error | The auth stream failed. |
+
+The application and router use `AppUser?`, not a Supabase SDK `User`.
+
+## 11. Run authentication commands with a controller
+
+File: `lib/features/auth/application/auth_controller.dart`
+
+### `authControllerProvider`
+
+This `NotifierProvider` exposes an `AsyncValue<void>`. It represents the
+state of a command currently being performed:
+
+```text
+idle → loading → data (success)
+               ↘ error (failure)
+```
+
+This is separate from `authStateProvider`:
+
+- `authControllerProvider` answers: “Is the sign-in/sign-up/sign-out button
+  running or did it fail?”
+- `authStateProvider` answers: “Who is currently authenticated?”
+
+### `AuthController.build()`
+
+Returns `AsyncData(null)`, the initial idle/success state before any command
+has been run.
+
+### `signInWithEmail`, `signUpWithEmail`, and `signOut`
+
+Each method follows the same pattern:
+
+1. Set `state` to `AsyncLoading`.
+2. Read the domain-facing repository provider.
+3. Run the relevant repository command.
+4. Use `AsyncValue.guard` to turn a success into `AsyncData` and an exception
+   into `AsyncError`.
+
+The controller has no navigation code. A successful session change is handled
+by the router, not by a screen or controller manually pushing a route.
+
+## 12. Build the presentation screens
+
+### `lib/features/auth/presentation/auth_loading_screen.dart`
+
+`AuthLoadingScreen` is a minimal loading indicator. GoRouter displays it while
+the initial session stream is loading. This avoids a protected task screen
+briefly appearing before the session is known.
+
+### `lib/features/auth/presentation/sign_in_screen.dart`
+
+`SignInScreen` is a `ConsumerStatefulWidget` because it needs:
+
+- a `Form` key for validation,
+- `TextEditingController` objects for email and password fields, and
+- `dispose()` to release those controllers.
+
+Its important methods are:
+
+| Method | Responsibility |
+| --- | --- |
+| `dispose()` | Frees both text controllers. |
+| `_submit()` | Validates the form, trims the email, then calls the controller's sign-in method. |
+| `build()` | Watches command state, displays errors with a snack bar, disables the button while loading, and provides navigation to sign-up. |
+| `_validateEmail()` | Checks for a non-empty, minimally valid email. |
+| `_validatePassword()` | Requires at least six characters, matching Supabase's default minimum. |
+
+The screen does **not** navigate to the home screen after a successful sign-in.
+Supabase emits a session event, and the router does that automatically.
+
+### `lib/features/auth/presentation/sign_up_screen.dart`
+
+`SignUpScreen` has the same structure as sign-in, but calls
+`signUpWithEmail`. It includes `AutofillHints.newPassword` and navigates back
+to the sign-in page when the user already has an account.
+
+For a local Supabase setup with email confirmation disabled, successful sign-up
+normally creates a session immediately. If confirmation is enabled later, the
+user may need to confirm their email before a session exists.
+
+## 13. Define typed auth routes
+
+File: `lib/app/router/routes.dart`
+
+Three `@TypedGoRoute` classes define the public auth routes:
+
+| Route class | Path | Screen |
+| --- | --- | --- |
+| `AuthLoadingRoute` | `/auth/loading` | `AuthLoadingScreen` |
+| `SignInRoute` | `/sign-in` | `SignInScreen` |
+| `SignUpRoute` | `/sign-up` | `SignUpScreen` |
+
+Each route's `build()` method returns its screen. GoRouter generates route
+helpers such as `const SignInRoute().go(context)` in `routes.g.dart`.
+
+`routes.g.dart` is generated. Do not edit it manually; regenerate it whenever
+you add or change a typed route:
+
+```powershell
+dart run build_runner build --delete-conflicting-outputs
+```
+
+## 14. Protect task routes with a central redirect
+
+File: `lib/app/router/app_router.dart`
+
+### `routerProvider`
+
+The router provider watches `authStateProvider`. That makes the router
+re-evaluate its `redirect` callback whenever the auth stream emits a new value.
+
+The redirect rules are:
+
+| Auth condition | Current destination | Result |
+| --- | --- | --- |
+| Session is loading | Any route except `/auth/loading` | Redirect to `/auth/loading` |
+| Signed out | `/sign-in` or `/sign-up` | Allow navigation |
+| Signed out | Any task route | Redirect to `/sign-in` |
+| Signed in | `/auth/loading`, `/sign-in`, or `/sign-up` | Redirect to `/` |
+| Signed in | Any task route | Allow navigation |
+
+This keeps the rule in one place. Individual task screens do not need to check
+authentication or navigate away when the user signs out.
+
+## 15. Add a sign-out action to the task home screen
+
+File: `lib/features/tasks/presentation/home_screen.dart`
+
+The app bar contains a logout icon. Pressing it calls:
+
+```dart
+ref.read(authControllerProvider.notifier).signOut()
+```
+
+The screen disables the icon while the command is loading and displays an
+error snack bar if it fails. It does not manually navigate. Sign-out causes a
+Supabase auth event, which reaches the router and redirects to `/sign-in`.
+
+## 16. End-to-end behavior
+
+### App launch while signed out
+
+```text
+App starts
+→ Supabase restores session
+→ authStateProvider is loading
+→ router opens /auth/loading
+→ stream emits null
+→ router redirects to /sign-in
+```
+
+### Sign in
+
+```text
+User submits valid credentials
+→ SignInScreen calls AuthController.signInWithEmail
+→ controller calls AuthRepository
+→ SupabaseAuthRepository calls Supabase
+→ Supabase emits a session event
+→ authStateProvider emits AppUser
+→ router redirects to /
+```
+
+### Sign out
+
+```text
+User presses the logout icon
+→ HomeScreen calls AuthController.signOut
+→ SupabaseAuthRepository calls Supabase signOut
+→ Supabase emits an event with session == null
+→ authStateProvider emits null
+→ router redirects to /sign-in
+```
+
+## 17. Verify the feature
+
+1. Start local Supabase.
+2. Launch the app using the local Dart-define configuration.
+3. Confirm the app opens the sign-in screen while no user is authenticated.
+4. Create an account on the sign-up screen.
+5. Confirm the app reaches the tasks home page when Supabase creates a
+   session.
+6. Close and reopen the app; Supabase should restore the session.
+7. Press sign out; the router should return to the sign-in page.
+8. Try opening a task route while signed out; the router should redirect to
+   `/sign-in`.
+
+Run static analysis after changes:
+
+```powershell
+flutter analyze
+```
+
+## 18. Common mistakes
+
+| Mistake | Why it is a problem | Correct approach |
+| --- | --- | --- |
+| Use `final String.fromEnvironment(...)` | Android Dart defines are compile-time constants. | Use `const`. |
+| Use `127.0.0.1` from an Android emulator | It points to the emulator itself. | Use `10.0.2.2` to reach the host computer. |
+| Put a password in `AppUser` | The app should not retain authentication secrets. | Keep only app-needed identity data. |
+| Import Supabase in a screen or domain file | It couples high-level code to the backend SDK. | Depend on `AuthRepository` through Riverpod. |
+| Use `_client.auth.currentUser` inside the event mapper | It may not represent the event that triggered the stream callback. | Map `event.session?.user`. |
+| Navigate manually after sign-in/sign-out | Navigation logic becomes duplicated across screens. | Let the auth-state router redirect handle it. |
+| Edit `*.g.dart` or `*.freezed.dart` | Regeneration overwrites the edits. | Change the source file and rerun build_runner. |
+
+## 19. Useful next improvements
+
+- Add a confirm-password field to the sign-up screen.
+- Replace minimal email validation with a more complete validation policy.
+- Show a friendly auth-error message instead of `error.toString()`.
+- Add repository and controller unit tests with a fake `AuthRepository`.
+- Preserve the originally requested route and return there after sign-in.
+- Add password-reset and email-confirmation flows.
