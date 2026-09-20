@@ -31,6 +31,13 @@ class TasksScreen extends ConsumerWidget {
               ref.read(themeModeProvider.notifier).setThemeMode(themeMode);
             },
           ),
+          TextButton.icon(
+            onPressed: () {
+              // TODO: add functionality for streak feature 
+            },
+            icon: const Icon(Icons.local_fire_department),
+            label: const Text('Fire'),
+          ),
         ],
       ),
 

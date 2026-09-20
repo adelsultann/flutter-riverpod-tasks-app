@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:tasks_app/features/auth/application/auth_providers.dart';
@@ -10,6 +11,7 @@ import 'routes.dart';
 //  be changed after the app is initialized.
 final routerProvider = Provider<GoRouter>((ref) {
   final authState = ref.watch(authStateProvider);
+  debugPrint("this is the current users ${authState.asData}",);
 
   return GoRouter(
     routes: $appRoutes,
